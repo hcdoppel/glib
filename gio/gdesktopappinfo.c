@@ -36,6 +36,7 @@
 #include "gdesktopappinfo.h"
 #ifdef G_OS_UNIX
 #include "glib-unix.h"
+#include "gunixfdlist.h"
 #endif
 #include "gfile.h"
 #include "gioerror.h"
@@ -2835,6 +2836,131 @@ g_desktop_app_info_make_platform_data (GDesktopAppInfo   *info,
   return g_variant_builder_end (&builder);
 }
 
+#ifdef G_OS_UNIX
+static GList *
+rewrite_uris_for_portal (GDesktopAppInfo    *info,
+                         GDBusConnection    *session_bus,
+                         GList              *uris)
+{
+  GVariantBuilder builder;
+  GUnixFDList *fd_list = NULL;
+  int *map = NULL;
+  int i, j;
+  GVariant *ret1 = NULL;
+  GVariant *ret2 = NULL;
+  GList *result = NULL;
+  char *mountpoint;
+  char **doc_ids;
+  GList *l;
+  GError *error = NULL;
+
+  ret1 = g_dbus_connection_call_sync (session_bus,
+                                     "org.freedesktop.portal.Documents",
+                                     "/org/freedesktop/portal/documents",
+                                     "org.freedesktop.portal.Documents",
+                                     "GetMountPoint",
+                                     NULL,
+                                     G_VARIANT_TYPE ("(ay)"),
+                                     G_DBUS_CALL_FLAGS_NONE,
+                                     -1,
+                                     NULL,
+                                     &error);
+  if (ret1 == NULL)
+    {
+      g_warning ("Failed to get mountpoint: %s", error->message);
+      g_error_free (error);
+      goto out;
+    }
+
+  g_variant_builder_init (&builder, G_VARIANT_TYPE_TUPLE);
+  g_variant_builder_add (&builder, "s", info->app_id);
+
+  map = g_new (int, g_list_length (uris));
+  fd_list = g_unix_fd_list_new ();
+
+  g_variant_builder_open (&builder, G_VARIANT_TYPE ("ah"));
+  for (l = uris, i = 0, j = 0; l; l = l->next, i++)
+    {
+      const char *uri = l->data;
+
+      map[i] = -1;
+
+      if (g_str_has_prefix (uri, "file:"))
+        {
+          const char *path;
+          int fd;
+          int idx;
+
+          path = uri + strlen ("file:");
+
+          fd = open (path, O_CLOEXEC | O_PATH);
+          if (fd < 0)
+            continue;
+
+          idx = g_unix_fd_list_append (fd_list, fd, NULL);
+          if (idx == -1)
+            continue;
+
+          g_variant_builder_add (&builder, "h", idx);
+          map[i] = j++;
+        }
+    }
+  g_variant_builder_close (&builder);
+
+  ret2 = g_dbus_connection_call_with_unix_fd_list_sync (session_bus,
+                                                        "org.freedesktop.portal.Documents",
+                                                        "/org/freedesktop/portal/documents",
+                                                        "org.freedesktop.portal.Documents",
+                                                        "AddMany",
+                                                        g_variant_builder_end (&builder),
+                                                        G_VARIANT_TYPE ("(as)"),
+                                                        G_DBUS_CALL_FLAGS_NONE,
+                                                        -1,
+                                                        fd_list,
+                                                        NULL,
+                                                        NULL,
+                                                        &error);
+  if (ret2 == NULL)
+    {
+      g_warning ("Failed to add many! %s", error->message);
+      g_error_free (error);
+      goto out;
+    }
+
+  g_variant_get (ret1, "(^&ay)", &mountpoint),
+  g_variant_get (ret2, "(^a&s)", &doc_ids);
+
+  for (l = uris, i = 0; l; l = l->next, i++)
+    {
+      char *uri = l->data;
+      char *ruri;
+
+      if (map[i] == -1)
+        ruri = g_strdup (uri);
+      else if (strcmp (doc_ids[map[i]], "") == 0)
+        ruri = g_strdup (uri);
+      else
+        {
+           char *basename = g_path_get_basename (uri + strlen ("file:"));
+           char *doc_path = g_build_filename (mountpoint, doc_ids[map[i]], basename, NULL);
+           ruri = g_strconcat ("file:", doc_path, NULL);
+           g_free (basename);
+           g_free (doc_path);
+        }
+
+      result = g_list_append (result, ruri);
+    }
+
+out:
+  g_free (map);
+  g_clear_object (&fd_list);
+  g_clear_pointer (&ret1, g_variant_unref);
+  g_clear_pointer (&ret2, g_variant_unref);
+
+  return result;
+}
+#endif
+
 static gboolean
 g_desktop_app_info_launch_uris_with_dbus (GDesktopAppInfo    *info,
                                           GDBusConnection    *session_bus,
@@ -2843,22 +2969,29 @@ g_desktop_app_info_launch_uris_with_dbus (GDesktopAppInfo    *info,
 {
   GVariantBuilder builder;
   gchar *object_path;
+  GList *ruris;
 
   g_return_val_if_fail (info != NULL, FALSE);
 
+#ifdef G_OS_UNIX
+  ruris = rewrite_uris_for_portal (info, session_bus, uris);
+#else
+  ruris = uris;
+#endif
+
   g_variant_builder_init (&builder, G_VARIANT_TYPE_TUPLE);
 
-  if (uris)
+  if (ruris)
     {
       GList *iter;
 
       g_variant_builder_open (&builder, G_VARIANT_TYPE_STRING_ARRAY);
-      for (iter = uris; iter; iter = iter->next)
+      for (iter = ruris; iter; iter = iter->next)
         g_variant_builder_add (&builder, "s", iter->data);
       g_variant_builder_close (&builder);
     }
 
-  g_variant_builder_add_value (&builder, g_desktop_app_info_make_platform_data (info, uris, launch_context));
+  g_variant_builder_add_value (&builder, g_desktop_app_info_make_platform_data (info, ruris, launch_context));
 
   /* This is non-blocking API.  Similar to launching via fork()/exec()
    * we don't wait around to see if the program crashed during startup.
@@ -2866,9 +2999,15 @@ g_desktop_app_info_launch_uris_with_dbus (GDesktopAppInfo    *info,
    */
   object_path = object_path_from_appid (info->app_id);
   g_dbus_connection_call (session_bus, info->app_id, object_path, "org.freedesktop.Application",
-                          uris ? "Open" : "Activate", g_variant_builder_end (&builder),
+                          ruris ? "Open" : "Activate", g_variant_builder_end (&builder),
                           NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL, NULL);
+
   g_free (object_path);
+}
+
+#ifdef G_OS_UNIX
+  g_list_free_full (ruris, g_free);
+#endif
 
   return TRUE;
 }
@@ -2890,6 +3029,7 @@ g_desktop_app_info_launch_uris_internal (GAppInfo                   *appinfo,
 
   session_bus = g_bus_get_sync (G_BUS_TYPE_SESSION, NULL, NULL);
 
+g_print ("launch uris: bus %d, app id %s\n", session_bus != NULL, info->app_id);
   if (session_bus && info->app_id)
     g_desktop_app_info_launch_uris_with_dbus (info, session_bus, uris, launch_context);
   else
